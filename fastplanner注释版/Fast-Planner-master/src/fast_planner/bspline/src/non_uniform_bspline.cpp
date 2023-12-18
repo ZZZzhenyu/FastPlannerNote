@@ -1,0 +1,513 @@
+/**
+* This file is part of Fast-Planner.
+*
+* Copyright 2019 Boyu Zhou, Aerial Robotics Group, Hong Kong University of Science and Technology, <uav.ust.hk>
+* Developed by Boyu Zhou <bzhouai at connect dot ust dot hk>, <uv dot boyuzhou at gmail dot com>
+* for more information see <https://github.com/HKUST-Aerial-Robotics/Fast-Planner>.
+* If you use this code, please cite the respective publications as
+* listed on the above website.
+*
+* Fast-Planner is free software: you can redistribute it and/or modify
+* it under the terms of the GNU Lesser General Public License as published by
+* the Free Software Foundation, either version 3 of the License, or
+* (at your option) any later version.
+*
+* Fast-Planner is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+* GNU General Public License for more details.
+*
+* You should have received a copy of the GNU Lesser General Public License
+* along with Fast-Planner. If not, see <http://www.gnu.org/licenses/>.
+*/
+
+
+
+#include "bspline/non_uniform_bspline.h"
+#include <ros/ros.h>
+
+namespace fast_planner {
+
+NonUniformBspline::NonUniformBspline(const Eigen::MatrixXd& points, const int& order,
+                                     const double& interval) {
+  setUniformBspline(points, order, interval);
+}
+
+NonUniformBspline::~NonUniformBspline() {}
+/*在获得控制点，轨迹次数，以及时间间隔的情况下，设置时间区间（Knot vector）, 需要注意的是，在Fast-planner的实现中，t p = 0 , 
+以文章中的3次样条函数为例，t 0 = − 3 Δ t , t 1 = − 2 Δ t , t 2 = − Δ t 
+*/
+void NonUniformBspline::setUniformBspline(const Eigen::MatrixXd& points, const int& order,
+                                          const double& interval) {
+  control_points_ = points;
+  p_              = order;//阶数p_
+  interval_       = interval;//时间间隔初值
+
+  n_ = points.rows() - 1;//轨迹段数n_
+  m_ = n_ + p_ + 1;//时间节点数m_
+
+  u_ = Eigen::VectorXd::Zero(m_ + 1);//时间区间u_(t0~tm)
+  for (int i = 0; i <= m_; ++i) {
+
+    if (i <= p_) {
+      u_(i) = double(-p_ + i) * interval_;
+    } else if (i > p_ && i <= m_ - p_) {
+      u_(i) = u_(i - 1) + interval_;
+    } else if (i > m_ - p_) {
+      u_(i) = u_(i - 1) + interval_;
+    }
+  }
+}
+
+void NonUniformBspline::setKnot(const Eigen::VectorXd& knot) { this->u_ = knot; }//设置时间节点
+
+Eigen::VectorXd NonUniformBspline::getKnot() { return this->u_; }
+
+void NonUniformBspline::getTimeSpan(double& um, double& um_p) {//返回轨迹的始末时间
+  um   = u_(p_);//一条b样条的定义域为[tpb,tM-pb]
+  um_p = u_(m_ - p_);
+}
+
+Eigen::MatrixXd NonUniformBspline::getControlPoint() { return control_points_; }
+
+pair<Eigen::VectorXd, Eigen::VectorXd> NonUniformBspline::getHeadTailPts() {//计算轨迹始末点状态
+  Eigen::VectorXd head = evaluateDeBoor(u_(p_));
+  Eigen::VectorXd tail = evaluateDeBoor(u_(m_ - p_));
+  return make_pair(head, tail);
+}
+
+Eigen::VectorXd NonUniformBspline::evaluateDeBoor(const double& u) {
+/*对给定时间u 如何计算该点的轨迹坐标值，
+计算处影响这段时间区间的控制点，由于va也是bspline轨迹，因此计算更高阶控制点
+通常的做法是根据Cox-DeBoor公式把整个B样条函数计算出来。但在evaluateDeBoor()这一函数中，作者采用的是递归的DeBoor算法
+*/
+  double ub = min(max(u_(p_), u), u_(m_ - p_));
+
+  // determine which [ui,ui+1] lay in//判断给定时间u在哪段时间区间内
+  int k = p_;
+  while (true) {
+    if (u_(k + 1) >= ub) break;
+    ++k;
+  }
+
+  /* deBoor's alg */
+  /*假设原有与此段轨迹相关的P+1个控制点为0阶‘控制点’，通过两个循环计算出第K个P阶的‘控制点’，该点即为要求的B样条函数值。
+  内循环通过递归公式求得高一阶的P+1个控制点，外循环提高阶数。*/
+  vector<Eigen::VectorXd> d;
+  for (int i = 0; i <= p_; ++i) {
+    d.push_back(control_points_.row(k - p_ + i));//该B样条曲线的重的一段曲线[ t i , t i + 1 ] 只被[ P i − p b , P i ]这p b + 1 个控制点影响。
+
+    // cout << d[i].transpose() << endl;
+  }
+
+  for (int r = 1; r <= p_; ++r) {//外循环提高阶数
+    for (int i = p_; i >= r; --i) {//内循环通过递归公式求得高一阶的P+1个控制点
+      double alpha = (ub - u_[i + k - p_]) / (u_[i + 1 + k - r] - u_[i + k - p_]);
+      // cout << "alpha: " << alpha << endl;
+      d[i] = (1 - alpha) * d[i - 1] + alpha * d[i];
+    }
+  }
+
+  return d[p_];//返回时间u所在的时间区间内，影响这段区间的控制点所对应的各阶导数。d[0]对应p，d[1]对应v，d[2]对应a
+}
+
+
+Eigen::VectorXd NonUniformBspline::evaluateDeBoorT(const double& t) {//直接得到一个[ t p , t m − p ] 作用域中的B样条函数值。？？？
+//嗲用evaluateDeBoor，t从p_开始//因为一条B样条的定义域为[ t P b , t M + 1 − P b ] 
+
+  return evaluateDeBoor(t + u_(p_));
+}
+
+
+//求非均匀B样条一阶及二阶微分
+/*当我们得到一条时间节点等同的均匀B样条曲线后，我们希望能够对这条曲线上的速度及加速度进行动力学检查，以备之后进行时间节点调整。
+于是我们需要计算出非均匀形式下的速度控制点及加速度控制点。（直接用均匀B样条的控制点算是因为均匀B样条可以看做特殊形式的非均匀B样条）*/
+//一个getDerivative()实现一阶导
+Eigen::MatrixXd NonUniformBspline::getDerivativeControlPoints() {
+  // The derivative of a b-spline is also a b-spline, its order become p_-1
+  // control point Qi = p_*(Pi+1-Pi)/(ui+p_+1-ui+1)
+  Eigen::MatrixXd ctp = Eigen::MatrixXd::Zero(control_points_.rows() - 1, control_points_.cols());//每高一阶，控制点少一个
+  for (int i = 0; i < ctp.rows(); ++i) {
+    ctp.row(i) =
+        p_ * (control_points_.row(i + 1) - control_points_.row(i)) / (u_(i + p_ + 1) - u_(i + 1));
+  }
+  return ctp;
+}
+NonUniformBspline NonUniformBspline::getDerivative() {
+  Eigen::MatrixXd   ctp = getDerivativeControlPoints();
+  NonUniformBspline derivative(ctp, p_ - 1, interval_);//在利用上图公式获得一阶微分控制点后，新定义一个NonUniformBspline对象，并将新的控制点，次数，Knot vector赋值给它。
+
+  /* cut the first and last knot */
+  Eigen::VectorXd knot(u_.rows() - 2);
+  knot = u_.segment(1, u_.rows() - 2);//代码中利用递归的形式求得速度与加速度，B样条的一阶微分是次数-1，控制点数-1的B样条曲线，因此相应的Knot vector-2。
+  derivative.setKnot(knot);
+
+  return derivative;
+}
+
+double NonUniformBspline::getInterval() { return interval_; }//返回时间间隔
+
+void NonUniformBspline::setPhysicalLimits(const double& vel, const double& acc) {
+  limit_vel_   = vel;
+  limit_acc_   = acc;
+  limit_ratio_ = 1.1;
+}
+
+
+//可达性检测
+/*利用如下两个公式计算每个控制点的速度和加速度是否超限，最大速度是多少，并获得调整比例*/
+bool NonUniformBspline::checkFeasibility(bool show) {
+  bool fea = true;
+  // SETY << "[Bspline]: total points size: " << control_points_.rows() << endl;
+
+  Eigen::MatrixXd P         = control_points_;
+  int             dimension = control_points_.cols();
+
+  /* check vel feasibility and insert points */
+  double max_vel = -1.0;//存储当前最大速度
+  for (int i = 0; i < P.rows() - 1; ++i) {//遍历所有控制点
+    Eigen::VectorXd vel = p_ * (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1));
+
+    if (fabs(vel(0)) > limit_vel_ + 1e-4 || fabs(vel(1)) > limit_vel_ + 1e-4 ||
+        fabs(vel(2)) > limit_vel_ + 1e-4) {
+
+      if (show) cout << "[Check]: Infeasible vel " << i << " :" << vel.transpose() << endl;
+      fea = false;//可达标识
+
+      for (int j = 0; j < dimension; ++j) {
+        max_vel = max(max_vel, fabs(vel(j)));
+      }
+    }
+  }
+
+  /* acc feasibility */
+  double max_acc = -1.0;
+  for (int i = 0; i < P.rows() - 2; ++i) {
+
+    Eigen::VectorXd acc = p_ * (p_ - 1) *
+        ((P.row(i + 2) - P.row(i + 1)) / (u_(i + p_ + 2) - u_(i + 2)) -
+         (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1))) /
+        (u_(i + p_ + 1) - u_(i + 2));
+
+    if (fabs(acc(0)) > limit_acc_ + 1e-4 || fabs(acc(1)) > limit_acc_ + 1e-4 ||
+        fabs(acc(2)) > limit_acc_ + 1e-4) {
+
+      if (show) cout << "[Check]: Infeasible acc " << i << " :" << acc.transpose() << endl;
+      fea = false;
+
+      for (int j = 0; j < dimension; ++j) {
+        max_acc = max(max_acc, fabs(acc(j)));
+      }
+    }
+  }
+
+  double ratio = max(max_vel / limit_vel_, sqrt(fabs(max_acc) / limit_acc_));//最大超限量
+
+  return fea;
+}
+
+double NonUniformBspline::checkRatio() {//返回va超限比例ratio
+  Eigen::MatrixXd P         = control_points_;
+  int             dimension = control_points_.cols();
+
+  // find max vel
+  double max_vel = -1.0;
+  for (int i = 0; i < P.rows() - 1; ++i) {
+    Eigen::VectorXd vel = p_ * (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1));
+    for (int j = 0; j < dimension; ++j) {
+      max_vel = max(max_vel, fabs(vel(j)));
+    }
+  }
+  // find max acc
+  double max_acc = -1.0;
+  for (int i = 0; i < P.rows() - 2; ++i) {
+    Eigen::VectorXd acc = p_ * (p_ - 1) *
+        ((P.row(i + 2) - P.row(i + 1)) / (u_(i + p_ + 2) - u_(i + 2)) -
+         (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1))) /
+        (u_(i + p_ + 1) - u_(i + 2));
+    for (int j = 0; j < dimension; ++j) {
+      max_acc = max(max_acc, fabs(acc(j)));
+    }
+  }
+  double ratio = max(max_vel / limit_vel_, sqrt(fabs(max_acc) / limit_acc_));
+  ROS_ERROR_COND(ratio > 2.0, "max vel: %lf, max acc: %lf.", max_vel, max_acc);
+
+  return ratio;
+}
+//进行时间重新分配
+/*通过计算当前控制点是否超限，以及调整表比例。对于当前控制点i有关的时间区间进行时间调整，[ t i , t i + p b + 1 ] 。
+注意，这里的p b是当前B样条的次数，如果是速度则是3-1=2, 加速度则是3-2=1（针对论文中的3次B样条曲线而言）。在t i + p b + 1 以后的是时间节点则是直接加上总的扩张时间就可以。
+*/
+//包含了可达性检测
+bool NonUniformBspline::reallocateTime(bool show) {
+  // SETY << "[Bspline]: total points size: " << control_points_.rows() << endl;
+  // cout << "origin knots:\n" << u_.transpose() << endl;
+  bool fea = true;
+
+  Eigen::MatrixXd P         = control_points_;
+  int             dimension = control_points_.cols();
+
+  double max_vel, max_acc;
+
+  /* check vel feasibility and insert points */
+  for (int i = 0; i < P.rows() - 1; ++i) {
+    Eigen::VectorXd vel = p_ * (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1));
+
+    if (fabs(vel(0)) > limit_vel_ + 1e-4 || fabs(vel(1)) > limit_vel_ + 1e-4 ||
+        fabs(vel(2)) > limit_vel_ + 1e-4) {
+
+      fea = false;
+      if (show) cout << "[Realloc]: Infeasible vel " << i << " :" << vel.transpose() << endl;
+
+      max_vel = -1.0;
+      for (int j = 0; j < dimension; ++j) {
+        max_vel = max(max_vel, fabs(vel(j)));
+      }
+
+      double ratio = max_vel / limit_vel_ + 1e-4;
+      if (ratio > limit_ratio_) ratio = limit_ratio_;
+//时间调整
+      double time_ori = u_(i + p_ + 1) - u_(i + 1);
+      double time_new = ratio * time_ori;//ratio作为时间调整比例
+      double delta_t  = time_new - time_ori;
+      double t_inc    = delta_t / double(p_);
+
+      for (int j = i + 2; j <= i + p_ + 1; ++j) {
+        u_(j) += double(j - i - 1) * t_inc;
+        if (j <= 5 && j >= 1) {
+          // cout << "vel j: " << j << endl;
+        }
+      }
+
+      for (int j = i + p_ + 2; j < u_.rows(); ++j) {
+        u_(j) += delta_t;
+      }
+    }
+  }
+
+  /* acc feasibility */
+  for (int i = 0; i < P.rows() - 2; ++i) {
+
+    Eigen::VectorXd acc = p_ * (p_ - 1) *
+        ((P.row(i + 2) - P.row(i + 1)) / (u_(i + p_ + 2) - u_(i + 2)) -
+         (P.row(i + 1) - P.row(i)) / (u_(i + p_ + 1) - u_(i + 1))) /
+        (u_(i + p_ + 1) - u_(i + 2));
+
+    if (fabs(acc(0)) > limit_acc_ + 1e-4 || fabs(acc(1)) > limit_acc_ + 1e-4 ||
+        fabs(acc(2)) > limit_acc_ + 1e-4) {
+
+      fea = false;
+      if (show) cout << "[Realloc]: Infeasible acc " << i << " :" << acc.transpose() << endl;
+
+      max_acc = -1.0;
+      for (int j = 0; j < dimension; ++j) {
+        max_acc = max(max_acc, fabs(acc(j)));
+      }
+
+      double ratio = sqrt(max_acc / limit_acc_) + 1e-4;
+      if (ratio > limit_ratio_) ratio = limit_ratio_;
+      // cout << "ratio: " << ratio << endl;
+
+      double time_ori = u_(i + p_ + 1) - u_(i + 2);
+      double time_new = ratio * time_ori;
+      double delta_t  = time_new - time_ori;
+      double t_inc    = delta_t / double(p_ - 1);
+
+      if (i == 1 || i == 2) {
+        // cout << "acc i: " << i << endl;
+        for (int j = 2; j <= 5; ++j) {
+          u_(j) += double(j - 1) * t_inc;
+        }
+
+        for (int j = 6; j < u_.rows(); ++j) {
+          u_(j) += 4.0 * t_inc;
+        }
+
+      } else {
+
+        for (int j = i + 3; j <= i + p_ + 1; ++j) {
+          u_(j) += double(j - i - 2) * t_inc;
+          if (j <= 5 && j >= 1) {
+            // cout << "acc j: " << j << endl;
+          }
+        }
+
+        for (int j = i + p_ + 2; j < u_.rows(); ++j) {
+          u_(j) += delta_t;
+        }
+      }
+    }
+  }
+
+  return fea;
+}
+
+void NonUniformBspline::lengthenTime(const double& ratio) {
+  int num1 = 5;
+  int num2 = getKnot().rows() - 1 - 5;
+
+  double delta_t = (ratio - 1.0) * (u_(num2) - u_(num1));
+  double t_inc   = delta_t / double(num2 - num1);
+  for (int i = num1 + 1; i <= num2; ++i) u_(i) += double(i - num1) * t_inc;
+  for (int i = num2 + 1; i < u_.rows(); ++i) u_(i) += delta_t;
+}
+
+void NonUniformBspline::recomputeInit() {}
+
+
+//通过对前端hybrid A*寻找到的初始路径进行拟合得到的初始控制点ctrl_pts
+void NonUniformBspline::parameterizeToBspline(const double& ts, const vector<Eigen::Vector3d>& point_set,
+                                              const vector<Eigen::Vector3d>& start_end_derivative,
+                                              Eigen::MatrixXd&               ctrl_pts){
+ /*首先假设获得的离散轨迹点point_set一共有K个，则有K-1段轨迹，根据B样条性质，这K-1段3次B样条曲线的定义域是[ u 3 , u 3 + k − 1 ]
+则一共有K+5个knot vector，即M = K − 1 + 3 + 3  ，所以应该有M-3即K+2个控制点。*/
+
+  if (ts <= 0) {
+    cout << "[B-spline]:time step error." << endl;
+    return;
+  }
+
+  if (point_set.size() < 2) {
+    cout << "[B-spline]:point set have only " << point_set.size() << " points." << endl;
+    return;
+  }
+
+  if (start_end_derivative.size() != 4) {
+    cout << "[B-spline]:derivatives error." << endl;
+  }
+
+  int K = point_set.size();//离散轨迹点个数
+//A：约束矩阵；x：控制点；b：路径点参数
+//p=sMQ：P是指路径点状态，一阶对应位置
+  // write A：
+  //通过对K+2个控制点构建K+4个等式约束（K个位置约束，两个速度约束，两个加速度约束），利用A x = b Ax=bAx=b进行线性拟合，即可得到拟合的控制点。
+  Eigen::Vector3d prow(3), vrow(3), arow(3);
+  prow << 1, 4, 1;
+  vrow << -1, 0, 1;
+  arow << 1, -2, 1;
+
+  Eigen::MatrixXd A = Eigen::MatrixXd::Zero(K + 4, K + 2);
+
+  for (int i = 0; i < K; ++i) A.block(i, i, 1, 3) = (1 / 6.0) * prow.transpose();//位置约束
+
+  A.block(K, 0, 1, 3)         = (1 / 2.0 / ts) * vrow.transpose();//起点速度约束
+  A.block(K + 1, K - 1, 1, 3) = (1 / 2.0 / ts) * vrow.transpose();//终点速度约束
+
+  A.block(K + 2, 0, 1, 3)     = (1 / ts / ts) * arow.transpose();//起点加速度约束
+  A.block(K + 3, K - 1, 1, 3) = (1 / ts / ts) * arow.transpose();//终点加速度约束                     //应该/2????
+  // cout << "A:\n" << A << endl;
+
+  // A.block(0, 0, K, K + 2) = (1 / 6.0) * A.block(0, 0, K, K + 2);
+  // A.block(K, 0, 2, K + 2) = (1 / 2.0 / ts) * A.block(K, 0, 2, K + 2);
+  // A.row(K + 4) = (1 / ts / ts) * A.row(K + 4);
+  // A.row(K + 5) = (1 / ts / ts) * A.row(K + 5);
+
+  // write b
+  Eigen::VectorXd bx(K + 4), by(K + 4), bz(K + 4);
+  for (int i = 0; i < K; ++i) {
+    bx(i) = point_set[i](0);
+    by(i) = point_set[i](1);
+    bz(i) = point_set[i](2);
+  }
+
+  for (int i = 0; i < 4; ++i) {
+    bx(K + i) = start_end_derivative[i](0);
+    by(K + i) = start_end_derivative[i](1);
+    bz(K + i) = start_end_derivative[i](2);
+  }
+
+  // solve Ax = b
+  Eigen::VectorXd px = A.colPivHouseholderQr().solve(bx);//A.colPivHouseholderQr().solve(bx)：egine库求解ax=b
+  Eigen::VectorXd py = A.colPivHouseholderQr().solve(by);
+  Eigen::VectorXd pz = A.colPivHouseholderQr().solve(bz);
+
+  // convert to control pts
+  ctrl_pts.resize(K + 2, 3);
+  ctrl_pts.col(0) = px;
+  ctrl_pts.col(1) = py;
+  ctrl_pts.col(2) = pz;
+
+  // cout << "[B-spline]: parameterization ok." << endl;
+}
+
+double NonUniformBspline::getTimeSum() {//调用getTimeSpan，返回轨迹总时间
+  double tm, tmp;
+  getTimeSpan(tm, tmp);
+  return tmp - tm;
+}
+
+double NonUniformBspline::getLength(const double& res) {//返回res到终点的距离
+  double          length = 0.0;
+  double          dur    = getTimeSum();
+  Eigen::VectorXd p_l    = evaluateDeBoorT(0.0), p_n;//evaluateDeBoorT(0.0)轨迹初始位置
+  for (double t = res; t <= dur + 1e-4; t += res) {//分段累加计算总距离
+    p_n = evaluateDeBoorT(t);
+    length += (p_n - p_l).norm();
+    p_l = p_n;
+  }
+  return length;
+}
+
+double NonUniformBspline::getJerk() {
+  NonUniformBspline jerk_traj = getDerivative().getDerivative().getDerivative();
+
+  Eigen::VectorXd times     = jerk_traj.getKnot();
+  Eigen::MatrixXd ctrl_pts  = jerk_traj.getControlPoint();
+  int             dimension = ctrl_pts.cols();
+
+  double jerk = 0.0;
+  for (int i = 0; i < ctrl_pts.rows(); ++i) {
+    for (int j = 0; j < dimension; ++j) {
+      jerk += (times(i + 1) - times(i)) * ctrl_pts(i, j) * ctrl_pts(i, j);
+    }
+  }
+
+  return jerk;
+}
+
+void NonUniformBspline::getMeanAndMaxVel(double& mean_v, double& max_v) {
+  NonUniformBspline vel = getDerivative();
+  double            tm, tmp;
+  vel.getTimeSpan(tm, tmp);
+
+  double max_vel = -1.0, mean_vel = 0.0;
+  int    num = 0;
+  for (double t = tm; t <= tmp; t += 0.01) {
+    Eigen::VectorXd vxd = vel.evaluateDeBoor(t);
+    double          vn  = vxd.norm();
+
+    mean_vel += vn;
+    ++num;
+    if (vn > max_vel) {
+      max_vel = vn;
+    }
+  }
+
+  mean_vel = mean_vel / double(num);
+  mean_v   = mean_vel;
+  max_v    = max_vel;
+}
+
+void NonUniformBspline::getMeanAndMaxAcc(double& mean_a, double& max_a) {
+  NonUniformBspline acc = getDerivative().getDerivative();
+  double            tm, tmp;
+  acc.getTimeSpan(tm, tmp);
+
+  double max_acc = -1.0, mean_acc = 0.0;
+  int    num = 0;
+  for (double t = tm; t <= tmp; t += 0.01) {
+    Eigen::VectorXd axd = acc.evaluateDeBoor(t);
+    double          an  = axd.norm();
+
+    mean_acc += an;
+    ++num;
+    if (an > max_acc) {
+      max_acc = an;
+    }
+  }
+
+  mean_acc = mean_acc / double(num);
+  mean_a   = mean_acc;
+  max_a    = max_acc;
+}
+}  // namespace fast_planner

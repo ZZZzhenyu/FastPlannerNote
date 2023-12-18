@@ -1,0 +1,20 @@
+bspline:定义的是非均匀b样条类，用来做时间重分配
+
+bspline_opt:后端b样条轨迹优化
+
+path_searching：三种前段路径搜索算法
+
+plan_env:地图生成，包括ESDF、grid map
+
+plan_manage:主文件
+
+poly_traj:定义多项式轨迹类
+
+traj_utils:轨迹可视化
+
+---------------
+修改：
+1、每个cmakelist中c++11该改为14
+2、Fast-Planner/uav_simulator/Utils/odom_visualization/src/odom_visualization.cpp中把/world前面的/去掉
+3\到/Fast-Planner/fast_planner/path_searching/src/kinodynamic_astar.cpp里搜KinodynamicAstar::timeToIndex函数，可以看到函数返回值是int，但是函数体没有return，修改完如下
+4\到Fast-Planner/fast_planner/plan_env/include/edt_environment.h第69和71行，把返回值类型由pair<double, Eigen::Vector3d>改成void，再去cpp文件中84到107行做同样修改。
